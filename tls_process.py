@@ -7,279 +7,344 @@ import laspy
 import open3d as o3d
 
 
-def load_station(path):
-    # wczytanie stanowiska z LAS/TXT
+#wczytywanie danych
 
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".las", ".laz"):
-        las = laspy.read(path)
-        xyz = np.asarray(las.xyz)
-    elif ext == ".txt":
-        xyz = np.loadtxt(path, comments="#")[:, :3]
+def wczytaj_chmure(sciezka):
+    """Wczytuje chmure punktow z pliku LAS/LAZ albo TXT."""
+    rozszerzenie = os.path.splitext(sciezka)[1].lower()
+
+    if rozszerzenie in (".las", ".laz"):
+        dane_las = laspy.read(sciezka)
+        punkty = np.asarray(dane_las.xyz)
+    elif rozszerzenie == ".txt":
+        # txt - zakladam ze kolumny to x y z (moze byc wiecej, bierzemy 3 pierwsze)
+        punkty = np.loadtxt(sciezka, comments="#")[:, :3]
     else:
-        raise ValueError(f"Nieobslugiwany format: {path}")
-    pc = o3d.geometry.PointCloud()
-    pc.points = o3d.utility.Vector3dVector(xyz)
-    return pc
+        raise ValueError(f"Nie wiem co zrobic z formatem: {sciezka}")
+
+    chmura = o3d.geometry.PointCloud()
+    chmura.points = o3d.utility.Vector3dVector(punkty)
+    return chmura
 
 
-def downsample(pc, voxel_size):
-    #Rozrzedzenie chmury punktow metoda voxel downsampling.
-    out = pc.voxel_down_sample(voxel_size=voxel_size)
-    print(f"  Downsampling ({voxel_size*100:.0f} cm): "
-          f"{len(pc.points)} -> {len(out.points)} punktow")
-    return out
+def wczytaj_targety(plik_txt):
+    """
+    Targety z pliku txt, format:
+    id  x  y  z
+    Linie zaczynajace sie od # sa pomijane, zrobilem tam opisy
+    """
+    wynik = {}
+    with open(plik_txt, "r") as f:
+        for linia in f:
+            linia = linia.strip()
+            if not linia or linia.startswith("#"):
+                continue
+            czesci = linia.split()
+            if len(czesci) < 4:
+                continue  # pomijamy dziwne linie
+            nr = int(float(czesci[0]))
+            wspolrzedne = np.array([float(czesci[1]), float(czesci[2]), float(czesci[3])])
+            wynik[nr] = wspolrzedne
+    return wynik
 
 
-def filter_cloud(pc, voxel_size):
-    #Filtracja geometryczna (ROR) + statystyczna (SOR).
-    n0 = len(pc.points)
-    pc_ror, _ = pc.remove_radius_outlier(nb_points=6, radius=voxel_size * 3.0)
-    print(f"  ROR: {n0} -> {len(pc_ror.points)} punktow "
-          f"(usunieto {n0 - len(pc_ror.points)})")
-    n1 = len(pc_ror.points)
-    pc_sor, _ = pc_ror.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    print(f"  SOR: {n1} -> {len(pc_sor.points)} punktow "
-          f"(usunieto {n1 - len(pc_sor.points)})")
-    return pc_sor
+#preprocessing
+
+def rozrzedz(chmura, rozmiar_voxela):
+    wynik = chmura.voxel_down_sample(voxel_size=rozmiar_voxela)
+    print(f"  downsampling ({rozmiar_voxela*100:.0f}cm): {len(chmura.points)} -> {len(wynik.points)} pkt")
+    return wynik
 
 
-def estimate_normals(pc, voxel_size):
-    # estymacja normalnych, orientacja w strone skanera
-    pc.estimate_normals(
+def filtruj(chmura, rozmiar_voxela):
+    # usuwanie outlierow - najpierw ROR potem SOR
+    ile_przed = len(chmura.points)
+
+    # ROR - radius outlier removal
+    chmura_ror, idx = chmura.remove_radius_outlier(nb_points=6,
+                                                    radius=rozmiar_voxela * 3.0)
+    print(f"  ROR: {ile_przed} -> {len(chmura_ror.points)} (usunieto {ile_przed - len(chmura_ror.points)})")
+
+    ile_po_ror = len(chmura_ror.points)
+
+    # SOR - statistical outlier removal
+    chmura_czysta, idx2 = chmura_ror.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    print(f"  SOR: {ile_po_ror} -> {len(chmura_czysta.points)} (usunieto {ile_po_ror - len(chmura_czysta.points)})")
+
+    return chmura_czysta
+
+
+def oblicz_normalne(chmura, rozmiar_voxela):
+    # normalne - promien szukania = 4x voxel, max 30 sasiadow
+    chmura.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 4.0, max_nn=30
-        )
-    )
-    pc.orient_normals_towards_camera_location(camera_location=np.array([0.0, 0.0, 0.0]))
-    return pc
+            radius=rozmiar_voxela * 4.0,
+            max_nn=30))
+    # orientacja w strone skanera (zakladamy ze skaner jest w 0,0,0)
+    chmura.orient_normals_towards_camera_location(
+        camera_location=np.array([0.0, 0.0, 0.0]))
+    return chmura
 
 
-def load_targets(path):
-    # wczytanie targetow z TXT (id x y z)
-    targets = {}
-    with open(path, "r") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            parts = s.split()
-            if len(parts) < 4:
-                continue
-            tid = int(float(parts[0]))
-            xyz = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
-            targets[tid] = xyz
-    return targets
+#rejestracja 
+
+def rejestracja_targetami(tgt_src, tgt_ref):
+    """
+    Liczy transformacje zrodlowej chmury do referencyjnej
+    na podstawie wspolnych targetow.
+    Zwraca macierz 4x4.
+    """
+    wspolne_id = sorted(set(tgt_src.keys()) & set(tgt_ref.keys()))
+    if len(wspolne_id) < 3:
+        raise ValueError(f"Za malo wspolnych targetow! Mam {len(wspolne_id)}, a potrzeba min 3")
+
+    # tworzymy chmury z samych targetow
+    src_pts = o3d.geometry.PointCloud()
+    ref_pts = o3d.geometry.PointCloud()
+    src_pts.points = o3d.utility.Vector3dVector(
+        np.array([tgt_src[i] for i in wspolne_id]))
+    ref_pts.points = o3d.utility.Vector3dVector(
+        np.array([tgt_ref[i] for i in wspolne_id]))
+
+    # korespondencje 1:1
+    koresp = o3d.utility.Vector2iVector([[i, i] for i in range(len(wspolne_id))])
+    estymator = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    macierz_T = estymator.compute_transformation(src_pts, ref_pts, koresp)
+
+    # rmse na targetach (zeby sprawdzic jakosc)
+    src_np = np.asarray(src_pts.points)
+    ref_np = np.asarray(ref_pts.points)
+    src_hom = np.hstack([src_np, np.ones((len(src_np), 1))])  # wspolrzedne jednorodne
+    src_po_transf = (macierz_T @ src_hom.T).T[:, :3]
+    bledy = np.sqrt(np.mean(np.sum((src_po_transf - ref_np)**2, axis=1)))
+    print(f"  wspolne targety: {wspolne_id}")
+    print(f"  RMSE na targetach: {bledy:.4f} m")
+
+    return macierz_T
 
 
-def target_based_registration(src_targets, ref_targets):
-    # transformacja src -> ref na podstawie wspolnych targetow
-    common = sorted(set(src_targets.keys()) & set(ref_targets.keys()))
-    if len(common) < 3:
-        raise ValueError(f"Za malo wspolnych punktow wiazacych: {len(common)} (min. 3)")
-    src_pc = o3d.geometry.PointCloud()
-    ref_pc = o3d.geometry.PointCloud()
-    src_pc.points = o3d.utility.Vector3dVector(np.array([src_targets[i] for i in common]))
-    ref_pc.points = o3d.utility.Vector3dVector(np.array([ref_targets[i] for i in common]))
-    corrs = o3d.utility.Vector2iVector([[i, i] for i in range(len(common))])
-    est = o3d.pipelines.registration.TransformationEstimationPointToPoint()
-    T = est.compute_transformation(src_pc, ref_pc, corrs)
+## ---------- zapis ----------
 
-    src_np = np.asarray(src_pc.points)
-    ref_np = np.asarray(ref_pc.points)
-    src_h = np.hstack([src_np, np.ones((len(src_np), 1))])
-    src_t = (T @ src_h.T).T[:, :3]
-    rmse = float(np.sqrt(np.mean(np.sum((src_t - ref_np) ** 2, axis=1))))
-    print(f"  Wspolne ID: {common}, RMSE na targets: {rmse:.4f} m")
-    return T
+def zapisz_chmure(chmura, katalog_wyj, nazwa):
+    os.makedirs(katalog_wyj, exist_ok=True)
 
+    # ply
+    sciezka_ply = os.path.join(katalog_wyj, f"{nazwa}.ply")
+    o3d.io.write_point_cloud(sciezka_ply, chmura)
+    print(f"  -> {sciezka_ply}")
 
-def save_cloud(pc, out_dir, name):
-    # zapis chmury do PLY + LAS
-    os.makedirs(out_dir, exist_ok=True)
-    ply = os.path.join(out_dir, f"{name}.ply")
-    o3d.io.write_point_cloud(ply, pc)
-    print(f"  Zapisano: {ply}")
-
-    xyz = np.asarray(pc.points)
-    header = laspy.LasHeader(point_format=3, version="1.2")
-    header.offsets = np.min(xyz, axis=0)
-    header.scales = np.array([0.001, 0.001, 0.001])
-    las = laspy.LasData(header)
-    las.x = xyz[:, 0]
-    las.y = xyz[:, 1]
-    las.z = xyz[:, 2]
-    las_path = os.path.join(out_dir, f"{name}.las")
-    las.write(las_path)
-    print(f"  Zapisano: {las_path}")
+    # las
+    xyz = np.asarray(chmura.points)
+    hdr = laspy.LasHeader(point_format=3, version="1.2")
+    hdr.offsets = np.min(xyz, axis=0)
+    hdr.scales = np.array([0.001, 0.001, 0.001])
+    las_out = laspy.LasData(hdr)
+    las_out.x = xyz[:, 0]
+    las_out.y = xyz[:, 1]
+    las_out.z = xyz[:, 2]
+    sciezka_las = os.path.join(katalog_wyj, f"{nazwa}.las")
+    las_out.write(sciezka_las)
+    print(f"  -> {sciezka_las}")
 
 
-def reconstruct_mesh(pc, method, voxel_size):
-    # triangulacja BPA lub Poisson
-    if not pc.has_normals():
-        pc.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=voxel_size * 4.0, max_nn=30
-            )
-        )
-        pc.orient_normals_towards_camera_location(np.array([0.0, 0.0, 0.0]))
+def zapisz_mesh(mesh, katalog_wyj, nazwa):
+    os.makedirs(katalog_wyj, exist_ok=True)
+    sciezka = os.path.join(katalog_wyj, f"{nazwa}.ply")
+    o3d.io.write_triangle_mesh(sciezka, mesh)
+    print(f"  mesh zapisany: {sciezka}")
 
-    if method == "bpa":
-        radii = [voxel_size * r for r in (1.5, 2.0, 3.0, 4.0)]
-        print(f"  Ball Pivoting, radii={radii}")
+
+## ---------- triangulacja (mesh) ----------
+
+def zrob_mesh(chmura, metoda, rozmiar_voxela):
+    """Triangulacja chmury - BPA albo Poisson."""
+
+    # upewniamy sie ze sa normalne
+    if not chmura.has_normals():
+        oblicz_normalne(chmura, rozmiar_voxela)
+
+    if metoda == "bpa":
+        # ball pivoting - testuje kilka promieni
+        promienie = [rozmiar_voxela * m for m in (1.5, 2.0, 3.0, 4.0)]
+        print(f"  BPA, promienie: {promienie}")
         mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-            pc, o3d.utility.DoubleVector(radii)
-        )
-    elif method == "poisson":
-        print("  Poisson (depth=9)")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pc, depth=9
-        )
-        densities = np.asarray(densities)
-        thr = np.quantile(densities, 0.05)
-        mesh.remove_vertices_by_mask(densities < thr)
+            chmura, o3d.utility.DoubleVector(promienie))
+
+    elif metoda == "poisson":
+        print("  Poisson depth=9...")
+        mesh, gestosc = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            chmura, depth=9)
+        # usuwamy trojkaty o niskiej gestosci (artefakty na brzegach)
+        gestosc_np = np.asarray(gestosc)
+        prog = np.quantile(gestosc_np, 0.05)
+        mesh.remove_vertices_by_mask(gestosc_np < prog)
     else:
+        print(f"  nieznana metoda: {metoda}??")
         return None
 
+    # czyszczenie mesha
     mesh.remove_duplicated_vertices()
     mesh.remove_duplicated_triangles()
     mesh.remove_degenerate_triangles()
     mesh.remove_non_manifold_edges()
     mesh.compute_vertex_normals()
-    print(f"  Mesh: {len(mesh.vertices)} wierzcholkow, {len(mesh.triangles)} trojkatow")
+
+    print(f"  wynik: {len(mesh.vertices)} wierzcholkow, {len(mesh.triangles)} trojkatow")
     return mesh
 
 
-def save_mesh(mesh, out_dir, name):
-    # zapis mesh do PLY
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{name}.ply")
-    o3d.io.write_triangle_mesh(path, mesh)
-    print(f"  Zapisano mesh: {path}")
+#szukanie plikow
+
+def znajdz_stanowiska(katalog):
+    pliki = []
+    for roz in ("*.las", "*.laz", "*.txt"):
+        pliki.extend(glob.glob(os.path.join(katalog, roz)))
+    return sorted(pliki)
 
 
-def find_stations(input_dir):
-    # szukanie plikow stanowisk w katalogu
-    files = []
-    for ext in ("*.las", "*.laz", "*.txt"):
-        files.extend(glob.glob(os.path.join(input_dir, ext)))
-    return sorted(files)
-
+# MAIN
 
 def main():
-    ap = argparse.ArgumentParser(description="Przetwarzanie danych TLS")
-    ap.add_argument("--input", default=".", help="Katalog ze stanowiskami (.las/.laz/.txt)")
-    ap.add_argument("--output", required=True, help="Katalog zapisu wynikow")
-    ap.add_argument("--targets", default="./targets",
-                    help="Katalog z plikami TXT punktow wiazacych (nazwy == nazwy stanowisk)")
-    ap.add_argument("--reference", default=None,
-                    help="Nazwa stanowiska referencyjnego (bez rozszerzenia). Domyslnie pierwsze alfabetycznie.")
-    ap.add_argument("--voxel", type=float, default=0.05, help="Rozmiar voxela [m] (domyslnie 0.05)")
-    ap.add_argument("--stations", nargs="+", default=None,
-                    help="Opcjonalna lista nazw stanowisk do przetworzenia (bez rozszerzen)")
-    ap.add_argument("--icp", action="store_true",
-                    help="Dodatkowa poprawa orientacji algorytmem ICP po Target-Based (ocena 4.0)")
-    ap.add_argument("--icp-threshold", type=float, default=0.2,
-                    help="Max odleglosc korespondencji w ICP [m] (domyslnie 0.2)")
-    ap.add_argument("--mesh", choices=["none", "bpa", "poisson"], default="none",
-                    help="Triangulacja per stanowisko: bpa=Ball Pivoting, poisson=Poisson (ocena 4.0)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Przetwarzanie chmur punktow TLS - projekt")
+    parser.add_argument("--input", default=".",
+                        help="katalog z plikami stanowisk (.las/.laz/.txt)")
+    parser.add_argument("--output", required=True,
+                        help="katalog na wyniki")
+    parser.add_argument("--targets", default="./targets",
+                        help="katalog z plikami txt targetow")
+    parser.add_argument("--reference", default=None,
+                        help="nazwa stanowiska referencyjnego (bez rozszerzenia)")
+    parser.add_argument("--voxel", type=float, default=0.05,
+                        help="rozmiar voxela w metrach (def. 0.05)")
+    parser.add_argument("--stations", nargs="+", default=None,
+                        help="opcjonalnie: lista nazw stanowisk do przetworzenia")
+    # argumenty do oc. 4.0
+    parser.add_argument("--icp", action="store_true",
+                        help="wlacz ICP po target-based")
+    parser.add_argument("--icp-threshold", type=float, default=0.2,
+                        help="prog odleglosci ICP (def. 0.2m)")
+    parser.add_argument("--mesh", choices=["none", "bpa", "poisson"],
+                        default="none",
+                        help="metoda triangulacji (none/bpa/poisson)")
+    args = parser.parse_args()
 
-    all_files = find_stations(args.input)
+    # szukamy plikow stanowisk
+    lista_plikow = znajdz_stanowiska(args.input)
+
     if args.stations:
-        wanted = set(args.stations)
-        all_files = [f for f in all_files
-                     if os.path.splitext(os.path.basename(f))[0] in wanted]
+        # filtruj do wybranych
+        wybrane = set(args.stations)
+        lista_plikow = [f for f in lista_plikow
+                        if os.path.splitext(os.path.basename(f))[0] in wybrane]
     else:
-        def has_targets(p):
-            name = os.path.splitext(os.path.basename(p))[0]
-            return os.path.exists(os.path.join(args.targets, name + ".txt"))
-        all_files = [f for f in all_files if has_targets(f)]
+        # bierzemy tylko te ktore maja plik z targetami
+        tmp = []
+        for p in lista_plikow:
+            nazwa = os.path.splitext(os.path.basename(p))[0]
+            plik_tgt = os.path.join(args.targets, nazwa + ".txt")
+            if os.path.exists(plik_tgt):
+                tmp.append(p)
+        lista_plikow = tmp
 
-    if len(all_files) < 2:
-        raise SystemExit(f"Znaleziono {len(all_files)} stanowisk - potrzeba >= 2.")
+    if len(lista_plikow) < 2:
+        print(f"BLAD: za malo stanowisk ({len(lista_plikow)}), potrzeba >= 2")
+        return
 
-    print(f"Stanowiska do przetworzenia: {[os.path.basename(f) for f in all_files]}")
+    print(f"Znalezione stanowiska: {[os.path.basename(f) for f in lista_plikow]}")
 
-    stations = {}
-    targets_per_station = {}
-    for path in all_files:
-        name = os.path.splitext(os.path.basename(path))[0]
-        print(f"\n[Stanowisko: {name}]  plik: {path}")
-        pc = load_station(path)
-        print(f"  Wczytano: {len(pc.points)} punktow")
-        pc = downsample(pc, args.voxel)
-        pc = filter_cloud(pc, args.voxel)
-        pc = estimate_normals(pc, args.voxel)
-        stations[name] = pc
+    # wczytywanie i preprocessing
+    chmury = {}     # nazwa -> chmura po preprocessingu
+    targety = {}    # nazwa -> dict targetow
 
-        tpath = os.path.join(args.targets, name + ".txt")
-        if not os.path.exists(tpath):
-            raise SystemExit(f"Brak pliku punktow wiazacych: {tpath}")
-        targets_per_station[name] = load_targets(tpath)
-        print(f"  Wczytano {len(targets_per_station[name])} punktow wiazacych z {tpath}")
+    for sciezka in lista_plikow:
+        nazwa = os.path.splitext(os.path.basename(sciezka))[0]
+        print(f"\n--- {nazwa} ({sciezka}) ---")
 
-    ref_name = args.reference or sorted(stations.keys())[0]
-    if ref_name not in stations:
-        raise SystemExit(f"Stanowisko referencyjne '{ref_name}' nie zostalo wczytane.")
-    print(f"\nStanowisko referencyjne: {ref_name}")
+        ch = wczytaj_chmure(sciezka)
+        print(f"  wczytano {len(ch.points)} punktow")
 
-    transformed = {}
-    ref_pc = stations[ref_name]
-    for name, pc in stations.items():
-        if name == ref_name:
-            print(f"\n[{name}] referencyjne - transformacja = I")
-            transformed[name] = pc
+        ch = rozrzedz(ch, args.voxel)
+        ch = filtruj(ch, args.voxel)
+        ch = oblicz_normalne(ch, args.voxel)
+        chmury[nazwa] = ch
+
+        # wczytaj targety
+        plik_tgt = os.path.join(args.targets, nazwa + ".txt")
+        if not os.path.exists(plik_tgt):
+            print(f"BLAD: brak pliku targetow {plik_tgt}")
+            return
+        targety[nazwa] = wczytaj_targety(plik_tgt)
+        print(f"  targety: {len(targety[nazwa])} pkt z {plik_tgt}")
+
+    # rejestracja
+    nazwa_ref = args.reference if args.reference else sorted(chmury.keys())[0]
+    if nazwa_ref not in chmury:
+        print(f"BLAD: stanowisko ref '{nazwa_ref}' nie istnieje!")
+        return
+
+    print(f"\nStanowisko referencyjne: {nazwa_ref}")
+
+    przetworzone = {}  # po transformacji
+    ref_chmura = chmury[nazwa_ref]
+
+    for nazwa, ch in chmury.items():
+        if nazwa == nazwa_ref:
+            print(f"\n[{nazwa}] to ref, pomijam transformacje")
+            przetworzone[nazwa] = ch
             continue
 
-        print(f"\n[{name}] -> rejestracja Target-Based do {ref_name}")
-        T = target_based_registration(targets_per_station[name],
-                                      targets_per_station[ref_name])
-        print(f"  Macierz Target-Based:\n{T}")
-        pc.transform(T)
+        print(f"\n[{nazwa}] -> rejestracja do {nazwa_ref}")
+        T = rejestracja_targetami(targety[nazwa], targety[nazwa_ref])
+        print(f"  macierz T:\n{T}")
+        ch.transform(T)
 
+        # opcjonalnie ICP
         if args.icp:
-            print(f"  [ICP] poprawa orientacji (threshold={args.icp_threshold} m)")
-            icp = o3d.pipelines.registration.registration_icp(
-                pc, ref_pc, args.icp_threshold, np.eye(4),
+            print(f"  ICP (threshold={args.icp_threshold}m)...")
+            wynik_icp = o3d.pipelines.registration.registration_icp(
+                ch, ref_chmura,
+                args.icp_threshold,
+                np.eye(4),
                 o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
-            )
-            print(f"  [ICP] fitness={icp.fitness:.4f}  inlier_rmse={icp.inlier_rmse:.4f} m")
-            print(f"  Macierz ICP (korekcja):\n{icp.transformation}")
-            pc.transform(icp.transformation)
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+            print(f"  ICP fitness={wynik_icp.fitness:.4f}, rmse={wynik_icp.inlier_rmse:.4f}m")
+            print(f"  macierz ICP:\n{wynik_icp.transformation}")
+            ch.transform(wynik_icp.transformation)
 
-        transformed[name] = pc
+        przetworzone[nazwa] = ch
 
-    colors = [
-        [1.0, 0.5, 0.0], [0.0, 0.5, 1.0], [0.2, 0.8, 0.2],
-        [0.9, 0.2, 0.7], [0.9, 0.9, 0.1], [0.3, 0.3, 0.9],
-    ]
-    merged = o3d.geometry.PointCloud()
-    for i, (name, pc) in enumerate(transformed.items()):
-        colored = o3d.geometry.PointCloud(pc)
-        colored.paint_uniform_color(colors[i % len(colors)])
-        merged += colored
+    # scalanie i kolorowanie
+    kolory = [
+        [1, 0.5, 0], [0, 0.5, 1], [0.2, 0.8, 0.2],
+        [0.9, 0.2, 0.7], [0.9, 0.9, 0.1], [0.3, 0.3, 0.9]]
 
-    print(f"\nScalona chmura: {len(merged.points)} punktow")
-    save_cloud(merged, args.output, "merged_cloud")
+    cala_chmura = o3d.geometry.PointCloud()
+    for i, (nazwa, ch) in enumerate(przetworzone.items()):
+        kopia = o3d.geometry.PointCloud(ch)
+        kopia.paint_uniform_color(kolory[i % len(kolory)])
+        cala_chmura += kopia
 
+    print(f"\nScalona chmura: {len(cala_chmura.points)} pkt")
+    zapisz_chmure(cala_chmura, args.output, "merged_cloud")
+
+    # triangulacja
     if args.mesh != "none":
-        print(f"\n=== Triangulacja ({args.mesh}) per stanowisko ===")
-        for name, pc in transformed.items():
-            print(f"\n[{name}] surface reconstruction")
-            mesh = reconstruct_mesh(pc, args.mesh, args.voxel)
-            if mesh is None or len(mesh.triangles) == 0:
-                print(f"  Brak trojkatow - pomijam zapis.")
+        print(f"\n=== triangulacja: {args.mesh} ===")
+        for nazwa, ch in przetworzone.items():
+            print(f"\n[{nazwa}]")
+            m = zrob_mesh(ch, args.mesh, args.voxel)
+            if m is None or len(m.triangles) == 0:
+                print("  brak trojkatow, pomijam")
                 continue
-            save_mesh(mesh, args.output, f"mesh_{name}")
+            zapisz_mesh(m, args.output, f"mesh_{nazwa}")
 
+    # wizualizacja
     try:
         o3d.visualization.draw_geometries(
-            [merged], window_name="TLS - scalona chmura"
-        )
-    except Exception as e:
-        print(f"(pominieto wizualizacje: {e})")
+            [cala_chmura], window_name="TLS - scalona chmura")
+    except Exception:
+        print("(nie udalo sie otworzyc wizualizacji, pewnie brak wyswietlacza)")
 
 
 if __name__ == "__main__":
