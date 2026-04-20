@@ -254,8 +254,8 @@ def main():
     print(f"Znalezione stanowiska: {[os.path.basename(f) for f in lista_plikow]}")
 
     # wczytywanie i preprocessing
-    chmury = {}     # nazwa -> chmura po preprocessingu
-    targety = {}    # nazwa -> dict targetow
+    chmury = {}     
+    targety = {}    
 
     for sciezka in lista_plikow:
         nazwa = os.path.splitext(os.path.basename(sciezka))[0]

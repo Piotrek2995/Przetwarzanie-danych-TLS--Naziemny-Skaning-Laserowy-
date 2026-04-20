@@ -91,9 +91,6 @@ W folderze z `--output`:
 9. Opcjonalnie triangulacja i czyszczenie mesha (duplikaty, zdegenerowane trojkaty, non-manifold)
 10. Na koncu probuje otworzyc podglad w Open3D (jak jest wyswietlacz)
 
-## Uwagi
 
-- Dla BPA testuje kilka promieni (1.5, 2.0, 3.0, 4.0 x voxel)
-- Dla Poissona uzywam depth=9, na koncu wycinam 5% trojkatow o najnizszej gestosci zeby pozbyc sie artefaktow na brzegach
-- Jak na ktoryms stanowisku brakuje pliku targetow to skrypt sie wywala
+
 - Kolory sa hardcoded (6 kolorow, potem sie powtarzaja)
