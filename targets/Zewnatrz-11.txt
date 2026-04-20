@@ -1,0 +1,5 @@
+# Punkty wiazace (targets) dla stanowiska Zewnatrz-11
+# Format: id x y z  (wspolrzedne w lokalnym ukladzie stanowiska)
+1 19.850000 2.510000 -3.110000
+2 22.580000 -1.280000 -3.020000
+3 25.520000 -2.800000 -3.040000
